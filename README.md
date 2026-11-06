@@ -1,153 +1,182 @@
-# CloudNote – Multi-Cloud Evaluation Project
+# CloudNote — Multi-Cloud Deployment & Failover Demo
 
-A small Next.js App Router application with Node.js route handlers and PostgreSQL. It is designed to run as a Docker container on Azure App Service (primary) and AWS App Runner (secondary), with Azure Traffic Manager providing DNS-based priority failover.
+A Next.js notes application deployed to **Azure App Service** and **AWS ECS Express Mode**, with a shared **Neon PostgreSQL** database. GitHub Actions builds, tests, containerizes, and deploys the application to both providers.
 
-## Features
+> **Scope:** This project demonstrates multi-cloud application deployment, CI/CD, shared-database access, and a manually tested DNS endpoint switch using Azure Traffic Manager. It does not claim measured automatic failover under five minutes. The shared Neon database remains a common dependency, so this is application-tier failover—not independent database HA/DR.
 
-- Create, list and delete notes using PostgreSQL.
-- `/api/health` checks the database and reports `CLOUD_PROVIDER`.
-- Docker multi-stage production image.
-- Local PostgreSQL + application using Docker Compose.
-- Separate GitHub Actions workflows for Azure and AWS.
-- OIDC-based cloud authentication in the workflow templates.
+## Live deployments
+
+| Component | URL |
+|---|---|
+| Azure application | https://cloudnote-f8h2huf8djekewff.centralindia-01.azurewebsites.net |
+| Azure health | https://cloudnote-f8h2huf8djekewff.centralindia-01.azurewebsites.net/api/health |
+| AWS application | https://cl-04bd4a7ed3c64fd6847753746699c32c.ecs.ap-south-1.on.aws |
+| AWS health | https://cl-04bd4a7ed3c64fd6847753746699c32c.ecs.ap-south-1.on.aws/api/health |
+| Traffic Manager DNS | https://cloudnote-failover-2026.trafficmanager.net |
+| GitHub repository | https://github.com/akash52004/cloudnote-multicloud |
+
+Use the direct Azure and AWS URLs for browser testing. Traffic Manager is DNS-based, not an HTTP reverse proxy. The Traffic Manager hostname is used for DNS endpoint-selection testing; it is not verified as a common browser-facing application URL because a custom domain/host-header setup is not configured for both origins.
 
 ## Architecture
 
+```mermaid
+flowchart TB
+    U[User / DNS client] --> TM[Azure Traffic Manager<br/>Priority routing<br/>TTL 60 seconds<br/>HTTPS probe /api/health]
+    TM -->|Priority 1: primary| AZ[Azure App Service<br/>Central India]
+    TM -.->|Priority 2: secondary| AWS[AWS ECS Express Mode<br/>Mumbai ap-south-1]
+    AZ --> DB[(Neon PostgreSQL<br/>Shared database)]
+    AWS --> DB
+    GH[GitHub Actions] -->|Azure workflow| AZ
+    GH -->|AWS workflow| AWS
+```
+
+### Components
+
+- **Application:** Next.js 15, React 19, Node.js.
+- **API:** Notes API for listing, creating, and deleting notes; health API reports status, database connectivity, and provider.
+- **Database:** Neon PostgreSQL shared by both cloud deployments.
+- **Container:** Multi-stage Docker build using Node.js 22 Alpine and Next.js standalone output; runtime runs as a non-root user.
+- **Azure:** Linux Azure App Service with Azure Container Registry (ACR).
+- **AWS:** Amazon ECS Express Mode with Amazon Elastic Container Registry (ECR).
+- **CI/CD:** Separate GitHub Actions workflows for Azure and AWS.
+- **Traffic management:** Azure Traffic Manager Priority routing; Azure priority 1, AWS priority 2; DNS TTL 60 seconds; HTTPS health probe on `/api/health`, 30-second probe interval, three tolerated failures, 10-second timeout.
+
+## CI/CD
+
+Both workflows run on pushes to `main` and support manual `workflow_dispatch`.
+
+### Azure — `.github/workflows/azure-deploy.yml`
+
+1. Checkout and set up Node.js 22.
+2. Run `npm ci`, `npm run lint`, and `npm run build`.
+3. Authenticate to Azure using GitHub OIDC.
+4. Build and push the Docker image to ACR.
+5. Configure the App Service container image and runtime settings.
+6. Restart the App Service.
+
+### AWS — `.github/workflows/aws-deploy.yml`
+
+1. Checkout and set up Node.js 22.
+2. Run `npm ci`, `npm run lint`, and `npm run build`.
+3. Assume the AWS deployment role using GitHub OIDC.
+4. Build and push the Docker image to ECR.
+5. Read the active ECS Express Mode container configuration and update its image while preserving existing runtime configuration.
+6. Deploy the updated image to ECS Express Mode.
+
+OIDC avoids storing long-lived cloud access keys in GitHub Actions secrets. The AWS role has scoped permissions for task-definition registration and passing the ECS task execution role.
+
+## Verification evidence
+
+### Health checks
+
+Both health endpoints returned healthy responses:
+
+- Azure: `status=ok`, `database=connected`, `provider=azure`.
+- AWS: `status=ok`, `database=connected`, `provider=aws`.
+
+### Shared database read test
+
+Azure and AWS `/api/notes` returned the same three records, with matching IDs, titles, content, and timestamps. This confirmed both deployments were reading the same Neon database.
+
+### Cross-cloud write/read test
+
+A note was created through AWS:
+
+- ID: `4`
+- Title: `AWS to Azure Write Test`
+- Content: `Created from AWS and verified from Azure.`
+
+The same record was retrieved through Azure `/api/notes`, verifying AWS-to-Azure shared-database visibility.
+
+### Traffic Manager manual DNS switch
+
+Traffic Manager was configured with Azure primary and AWS secondary. During the manual test, the Azure endpoint was disabled in Traffic Manager. A subsequent `nslookup` of the Traffic Manager hostname resolved to the AWS ECS Express Mode hostname and AWS IP addresses. The AWS health endpoint returned `status=ok`, `database=connected`, and `provider=aws`. The Azure primary endpoint was later restored.
+
+**Interpretation:** This demonstrates a manually initiated DNS endpoint switch. It is not a measured automatic failover triggered by an actual Azure outage. DNS resolver caching and client behavior can affect when a changed answer is observed.
+
+## Failover limitations
+
+- Traffic Manager is DNS-based; it does not proxy HTTP traffic or rewrite the Host header.
+- Automatic outage-based failover in less than five minutes has not been measured and is not claimed.
+- Both application instances use one shared Neon PostgreSQL database. If Neon is unavailable, both application instances may lose their database dependency.
+- This project does not demonstrate independent database high availability, cross-region replication, or database disaster recovery.
+- The Traffic Manager hostname should not be represented as a common browser-facing application URL until custom-domain and host-header configuration is completed for both origins.
+
+## Run locally
+
+### Prerequisites
+- Node.js 22 (or a compatible supported Node.js version)
+- Docker Desktop with Docker Compose
+
+Start the app and PostgreSQL:
+
+```bash
+docker compose up -d --build
+```
+
+Open `http://localhost:3000`.
+
+Check health:
+
+```bash
+curl http://localhost:3000/api/health
+```
+
+Stop containers while retaining the persistent database volume:
+
+```bash
+docker compose down
+```
+
+Remove the local database volume too (destructive):
+
+```bash
+docker compose down -v
+```
+
+## Repository structure
+
 ```text
-                         One hostname
-                              |
-                    Azure Traffic Manager
-                    Priority routing + probes
-                       /             \
-              Azure App Service    AWS App Runner
-                 (primary)           (secondary)
-                       \             /
-                        Shared PostgreSQL
+.
+├── app/
+│   └── api/
+│       ├── health/
+│       └── notes/
+├── .github/
+│   └── workflows/
+│       ├── azure-deploy.yml
+│       └── aws-deploy.yml
+├── Dockerfile
+├── docker-compose.yml
+├── next.config.mjs
+├── package.json
+└── README.md
 ```
 
-**Important:** Traffic Manager is DNS-based. It does not proxy application traffic. DNS caching and resolver behaviour mean failover is not guaranteed to be instantaneous. Configure a low DNS TTL, use a suitable probe interval/tolerated failures, and measure the real failover from an external client.
+## Environment configuration
 
-The two application deployments use the same shared PostgreSQL database. This demonstrates application failover only; it does not provide database high availability or disaster recovery.
+The application uses `DATABASE_URL` for PostgreSQL connectivity. Cloud deployments also set `PGSSL=true` and a provider identifier such as `CLOUD_PROVIDER=azure` or `CLOUD_PROVIDER=aws`.
 
-## Requirements
+Never commit `.env` files, database connection strings, passwords, cloud credentials, or deployment tokens. Configure secrets through cloud service settings and GitHub Actions secrets. Do not include real secret values in screenshots or documentation.
 
-- Node.js 22 recommended (Node.js 20.9+ is sufficient for this app).
-- Docker Desktop with WSL 2 backend.
-- Git.
-- A PostgreSQL database for cloud deployments that is reachable from both cloud services.
+## Operational and cost notes
 
-## Run locally with Docker Compose
+- GitHub Actions uses OIDC for Azure and AWS authentication.
+- Keep the AWS deployment role scoped to workflow requirements.
+- Review Azure App Service, ACR, ECS Express Mode, and ECR costs after the demo. These resources can incur charges. Stop or remove billable resources when no longer needed, after preserving required evidence.
 
-1. Copy `.env.example` only if you want a local environment file; Compose has local database settings already.
-2. From the project root, run:
+## Evidence checklist
 
-```bash
-docker compose up --build
-```
+- [ ] Successful Azure GitHub Actions run.
+- [ ] Successful AWS GitHub Actions run.
+- [ ] Azure and AWS health endpoint responses.
+- [ ] Same notes returned by both providers.
+- [ ] AWS-created note retrieved through Azure.
+- [ ] Traffic Manager routing priorities and health probe configuration.
+- [ ] DNS resolution to AWS after manually disabling Azure.
+- [ ] AWS health response during the manual switch.
+- [ ] Azure primary endpoint restored and healthy.
 
-3. Open `http://localhost:3000`.
-4. Test the health endpoint: `http://localhost:3000/api/health`.
-5. Create a note, refresh the page and verify it persists.
-6. Stop the stack with `Ctrl+C`; remove containers with `docker compose down`. To remove local database data too, use `docker compose down -v`.
+## Summary
 
-## Run locally without Docker
-
-1. Install dependencies:
-
-```bash
-npm install
-```
-
-2. Create a PostgreSQL database and execute `database/schema.sql`.
-3. Copy `.env.example` to `.env.local` and set `DATABASE_URL`.
-4. Run:
-
-```bash
-npm run dev
-```
-
-## Environment variables
-
-| Variable | Description |
-|---|---|
-| `DATABASE_URL` | PostgreSQL connection string |
-| `PGSSL` | Set `true` if the provider requires TLS |
-| `CLOUD_PROVIDER` | `azure`, `aws`, `local`, or `local-docker` |
-
-Set these as application environment variables in each cloud service. Never commit real credentials or connection strings.
-
-## Azure deployment outline
-
-1. Create an Azure Container Registry (ACR).
-2. Create an Azure App Service Web App using a Linux custom container.
-3. Configure App Service to pull the image from ACR (managed identity with `AcrPull` is preferred).
-4. Configure `DATABASE_URL`, `PGSSL`, `CLOUD_PROVIDER=azure`, and `WEBSITES_PORT=3000` in App Service settings.
-5. Configure GitHub OIDC federation for Azure and grant the deployment identity the minimum required permissions for ACR push and App Service update.
-6. Add the Azure workflow secrets listed below.
-
-## AWS deployment outline
-
-1. Create an ECR repository.
-2. Create an App Runner service using the ECR image.
-3. Configure an App Runner ECR access role.
-4. Configure `DATABASE_URL`, `PGSSL`, and `CLOUD_PROVIDER=aws` as App Runner runtime environment variables.
-5. Configure GitHub OIDC federation in AWS and grant the role permission to push to ECR and update the specific App Runner service.
-6. Add the AWS workflow secrets listed below.
-
-## GitHub Actions secrets
-
-### Azure workflow (`azure-deploy.yml`)
-
-- `AZURE_CLIENT_ID`
-- `AZURE_TENANT_ID`
-- `AZURE_SUBSCRIPTION_ID`
-- `AZURE_RESOURCE_GROUP`
-- `AZURE_WEBAPP_NAME`
-- `ACR_NAME`
-- `ACR_LOGIN_SERVER`
-
-The Azure identity must be configured for GitHub OIDC. It needs permissions to push to ACR and update the App Service. Configure the App Service's ACR pull identity separately.
-
-### AWS workflow (`aws-deploy.yml`)
-
-- `AWS_GITHUB_ACTIONS_ROLE_ARN`
-- `AWS_REGION`
-- `ECR_REPOSITORY`
-- `APP_RUNNER_SERVICE_ARN`
-
-The AWS role trust policy should restrict the GitHub OIDC subject to your repository and branch/environment. Its permissions should be limited to the target ECR repository and App Runner service.
-
-## Traffic Manager failover outline
-
-1. Create an Azure Traffic Manager profile using **Priority** routing.
-2. Add the Azure App Service hostname as priority 1.
-3. Add the AWS App Runner service hostname as priority 2.
-4. Configure an HTTPS health probe to `/api/health` on port 443. The probe expects HTTP 200; the endpoint returns 503 if PostgreSQL is unavailable.
-5. Set a low DNS TTL and configure probe interval/tolerated failures to meet the target as closely as possible.
-6. Point your custom hostname's DNS record to the Traffic Manager profile as instructed by your DNS provider and Azure.
-7. Verify normal routing, then simulate primary failure in a controlled test. Record the time of failure, probe detection, DNS response changes and client-observed switchover.
-
-Traffic Manager endpoint monitoring can detect a failed Azure endpoint and return the AWS endpoint in DNS responses. It cannot force every client to immediately discard a cached DNS answer. Do not claim sub-five-minute failover until you have measured it from multiple clients/resolvers.
-
-## Evidence checklist for the evaluation
-
-- [ ] Screenshot showing hostname resolving to Azure during normal operation.
-- [ ] Azure App Service logs and `/api/health` response showing `provider: azure`.
-- [ ] Traffic Manager profile with priority endpoints and health probe configuration.
-- [ ] Controlled primary failure and health-probe detection evidence.
-- [ ] Same hostname resolving to AWS after failover.
-- [ ] `/api/health` response showing `provider: aws`.
-- [ ] Create a note before failover and verify the same note after failover.
-- [ ] Successful Azure and AWS GitHub Actions runs.
-- [ ] Explain the shared-database limitation and DNS caching behaviour.
-
-## API
-
-- `GET /api/health` – database health and serving provider.
-- `GET /api/notes` – list notes.
-- `POST /api/notes` – create a note (`{"title":"...","content":"..."}`).
-- `DELETE /api/notes?id=1` – delete a note.
-
-## Before presenting
-
-This repository is a working starter implementation, not proof of a completed cloud deployment. You must create the cloud resources, configure secrets/identities, run the workflows, validate the application and collect real failover evidence. Review and test each workflow against your own resource names and cloud configuration before relying on it in the evaluation.
+CloudNote demonstrates a containerized Next.js application deployed to Azure and AWS with independent GitHub Actions pipelines, a shared Neon PostgreSQL data layer, provider-specific health checks, and a manually verified Azure Traffic Manager DNS endpoint switch. The evidence supports multi-cloud application deployment and application-tier failover testing, with the shared database and unmeasured automatic failover clearly documented as limitations.
