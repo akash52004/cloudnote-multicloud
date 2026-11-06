@@ -57,7 +57,7 @@ jobs:
           az webapp config appsettings set \
             --resource-group "${{ secrets.AZURE_RESOURCE_GROUP }}" \
             --name "${{ secrets.AZURE_WEBAPP_NAME }}" \
-            --settings WEBSITES_PORT=3000 CLOUD_PROVIDER=azure
+            --settings WEBSITES_PORT=3000 CLOUD_PROVIDER=azure PGSSL=true
           az webapp restart \
             --resource-group "${{ secrets.AZURE_RESOURCE_GROUP }}" \
             --name "${{ secrets.AZURE_WEBAPP_NAME }}"

@@ -1,4 +1,4 @@
-name: Build and deploy to AWS App Runner
+name: Build and deploy to AWS ECS Express Mode
 
 on:
   push:
@@ -12,6 +12,7 @@ permissions:
 jobs:
   build-test-deploy:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -48,8 +49,21 @@ jobs:
           docker push "$REGISTRY/$REPOSITORY:$IMAGE_TAG"
           echo "IMAGE_URI=$REGISTRY/$REPOSITORY:$IMAGE_TAG" >> "$GITHUB_ENV"
 
-      - name: Update App Runner image and deploy
+      - name: Preserve current container configuration
         run: |
-          aws apprunner update-service \
-            --service-arn "${{ secrets.APP_RUNNER_SERVICE_ARN }}" \
-            --source-configuration "ImageRepository={ImageIdentifier=${IMAGE_URI},ImageRepositoryType=ECR,ImageConfiguration={Port=3000,RuntimeEnvironmentVariables={CLOUD_PROVIDER=aws}}}"
+          aws ecs describe-express-gateway-service \
+            --service-arn "arn:aws:ecs:ap-south-1:904233105357:service/default/cloudnote-aws" \
+            --query "service.activeConfigurations[0].primaryContainer" \
+            --output json > primary-container.json
+
+          jq --arg image "$IMAGE_URI" \
+            '.image = $image' \
+            primary-container.json > updated-primary-container.json
+
+      - name: Deploy to ECS Express Mode
+        run: |
+          aws ecs update-express-gateway-service \
+            --service-arn "arn:aws:ecs:ap-south-1:904233105357:service/default/cloudnote-aws" \
+            --primary-container file://updated-primary-container.json \
+            --region "${{ secrets.AWS_REGION }}" \
+            --monitor-resources DEPLOYMENT
